@@ -3,10 +3,11 @@
 Version control for directories you can only reach via SFTP, FTP, WebDAV, S3 or any other storage
 [rclone](https://rclone.org) supports. For example cheap web hosting without SSH access.
 
-The command is called `gite`.
+The command is `git-everywhere`, with the short alias `gite`. Since it is named `git-<something>`,
+`git everywhere` works as well.
 
 Git needs a computer to do its work, but the server does not have to be that computer.
-gite does all the git work on your machine and uses the server only as storage:
+git-everywhere does all the git work on your machine and uses the server only as storage:
 
 1. **Download**: rclone compares the server with your local copy (size and modification time) and downloads only what changed.
 2. **Commit**: plain git commits the new state locally.
@@ -21,8 +22,9 @@ You need `bash` (3.2 or newer), `git` (2.28 or newer) and `rclone`.
 
 ```sh
 brew install rclone            # or see https://rclone.org/install/
-curl -o ~/bin/gite https://raw.githubusercontent.com/sjespersen/git-everywhere/main/gite
-chmod +x ~/bin/gite
+curl -o ~/bin/git-everywhere https://raw.githubusercontent.com/sjespersen/git-everywhere/main/git-everywhere
+chmod +x ~/bin/git-everywhere
+ln -s git-everywhere ~/bin/gite   # optional short alias
 ```
 
 Set up a connection to your server once with `rclone config`, e.g. an SFTP remote named `myhost`.
@@ -30,16 +32,17 @@ Set up a connection to your server once with `rclone config`, e.g. an SFTP remot
 ## Usage
 
 ```sh
-gite init myhost:htdocs mysite --exclude '/cache/**' --exclude '/uploads/**'
+git-everywhere init myhost:htdocs mysite --exclude '/cache/**' --exclude '/uploads/**'
 cd mysite
 
-gite status                    # what changed on the server since the last snapshot?
-gite snapshot -m "before plugin update"
+git-everywhere status          # what changed on the server since the last snapshot?
+git-everywhere snapshot -m "before plugin update"
 
 git log --stat                 # it is a normal git repository
 git diff HEAD~1 -- index.php
 
-gite restore HEAD~1            # put the server back, asks before uploading
+git-everywhere restore HEAD~1  # put the server back, asks before uploading
+gite snapshot                  # the same, with the short alias
 ```
 
 | Command | What it does |
@@ -51,7 +54,7 @@ gite restore HEAD~1            # put the server back, asks before uploading
 | `fetch` | Download new history, e.g. when you also work from another machine. |
 | `uninstall [--yes]` | Delete the history from the server after asking. Your files there are not touched. The local copy stays as a plain git repository with the full history; delete its folder if you no longer need it. Refuses if the server has commits your copy does not have (`fetch` first). |
 
-Extra rclone flags go into `RCLONE_FLAGS`, e.g. `RCLONE_FLAGS="--checksum -v" gite snapshot`.
+Extra rclone flags go into `RCLONE_FLAGS`, e.g. `RCLONE_FLAGS="--checksum -v" git-everywhere snapshot`.
 
 ## Where things are
 
@@ -69,12 +72,12 @@ The history folder gets an `.htaccess` with `Require all denied`, because on man
 web root. Check that your server honours it (Apache does), or put the history somewhere that is not served
 with `--history`.
 
-Since the history is plain git bundles, you can always get it back without gite:
+Since the history is plain git bundles, you can always get it back without git-everywhere:
 download the bundles and run `git fetch <bundle> main` for each of them in order.
 
 ## Limitations
 
-- **One writer at a time.** FTP has no locks. gite refuses to upload when the server has history
+- **One writer at a time.** FTP has no locks. git-everywhere refuses to upload when the server has history
   your copy does not know (`fetch` first), but two snapshots running at the same moment can still collide.
 - **Change detection uses size and modification time.** Some FTP servers report times with low precision.
   Use `RCLONE_FLAGS=--checksum` where the server supports hashes, or `--download` to compare contents.

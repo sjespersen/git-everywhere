@@ -3,7 +3,7 @@
 # Usage: tests/run.sh   (needs git and rclone)
 set -euo pipefail
 
-GE="$(cd "$(dirname "$0")/.." && pwd)/gite"
+GE="$(cd "$(dirname "$0")/.." && pwd)/git-everywhere"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -105,6 +105,9 @@ check "recreated history has the filter" test -f "$SERVER.git-everywhere/everywh
 same "snapshot after uninstall writes one full bundle" 1 "$(ls "$SERVER.git-everywhere/bundles" | wc -l | tr -d ' ')"
 "$GE" init "$SERVER" third >/dev/null 2>&1
 same "the restored history is complete" "$(git -C site rev-list --count HEAD)" "$(git -C third rev-list --count HEAD)"
+
+same "works as git subcommand" "$("$GE" version)" "$(PATH="${GE%/*}:$PATH" git everywhere version)"
+same "gite alias works" "$("$GE" version)" "$("${GE%/*}/gite" version | sed 's/^gite/git-everywhere/')"
 
 echo
 if [ "$FAILS" -eq 0 ]; then echo "all tests passed"; else echo "$FAILS test(s) failed"; exit 1; fi
