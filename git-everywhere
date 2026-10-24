@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# git-everywhere: version control for directories you can only reach via SFTP, FTP, WebDAV, S3, …
+#
+# All git work happens on your machine. rclone moves the files: it pulls the server state into a
+# local work tree, git commits it, and the history is copied back next to the files on the server.
+# Nothing needs to run on the server.
+#
+# Works with bash 3.2 (macOS), git >= 2.28 and rclone.
+set -euo pipefail
+
+VERSION=0.1.0
+ME=$(basename "$0")
+
+die() { echo "$ME: $*" >&2; exit 1; }
+info() { echo "==> $*" >&2; }
+
+usage() {
+	cat <<EOF
+$ME $VERSION - git history for servers without git
+
+Usage:
+  $ME init <remote> [<dir>] [--history <remote>] [--exclude <pattern>]…
+                          Create a local copy of <remote> and take the first snapshot.
+                          --exclude takes rclone filter patterns, e.g. '/cache/**'.
+                          <remote> is anything rclone understands, e.g. myftp:htdocs.
+                          If history already exists on the server, it is downloaded.
+  $ME snapshot [-m <msg>] Download changes from the server and commit them.
+  $ME status              Show what changed on the server since the last snapshot.
+  $ME restore <rev> [--yes]
+                          Put the server back to the state of commit <rev>.
+                          Takes a snapshot first, shows the changes and asks before uploading.
+  $ME fetch               Download the history from the server (e.g. after using another machine).
+  $ME help | version
+
+Inside the local copy, use plain git to look around: git log, git diff, git show, …
+
+Environment:
+  RCLONE_FLAGS            Extra flags for every rclone call, e.g. "--checksum" or "-v".
+
+Settings live in .git/config (everywhere.remote, everywhere.history),
+file filters in .git/everywhere-filter (rclone filter syntax).
+EOF
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"; }
+
+# rclone with the user's extra flags (word splitting of RCLONE_FLAGS is intended)
+rc() {
+	# shellcheck disable=SC2086
+	rclone ${RCLONE_FLAGS:-} "$@"
+}
+
+g() { git -C "$ROOT" "$@"; }
+
+# Copy history between .git and the server. Files that are local only never go to the server.
+# Only adds and overwrites, never deletes.
+copy_history() {
+	rc copy "$1" "$2" --exclude /config --exclude /index --exclude '/hooks/**' --exclude '/logs/**' \
+		--exclude /COMMIT_EDITMSG --exclude /ORIG_HEAD --exclude /.htaccess
+}
+
+load_root() {
+	ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a $ME directory"
+	REMOTE=$(g config --get everywhere.remote) || die "$ROOT is not a $ME directory (see '$ME init')"
+	HISTORY=$(g config --get everywhere.history) || die "everywhere.history is not set in $ROOT/.git/config"
+	FILTER="$ROOT/.git/everywhere-filter"
+	BRANCH=$(g symbolic-ref --short HEAD)
+}
+
+# Prefix that paths below $REMOTE start with ("host:" stays, "host:dir" becomes "host:dir/")
+remote_prefix() {
+	case $REMOTE in
+		*: | */) echo "$REMOTE" ;;
+		*) echo "$REMOTE/" ;;
+	esac
+}
+
+write_filter() {
+	{
+		echo "# rclone filter rules (https://rclone.org/filtering/), used for downloads and uploads."
+		echo "# Excluded files are neither versioned nor touched on the server."
+		echo "- /.git/**"
+		local prefix rel
+		prefix=$(remote_prefix)
+		case $HISTORY in
+			"$prefix"*)
+				rel=${HISTORY#"$prefix"}
+				echo "- /${rel%/}/**"
+				;;
+		esac
+		echo "# - /wp-content/uploads/**"
+		echo "# - /cache/**"
+	} >"$FILTER"
+}
+
+# Refuse to work if the server has history this copy does not contain.
+check_history() {
+	local remote_head
+	remote_head=$(rc cat "$HISTORY/refs/heads/$BRANCH" 2>/dev/null || true)
+	[ -z "$remote_head" ] && return 0
+	if g cat-file -e "$remote_head^{commit}" 2>/dev/null &&
+		g merge-base --is-ancestor "$remote_head" HEAD 2>/dev/null; then
+		return 0
+	fi
+	die "the history on the server has commits this copy does not know. Run '$ME fetch' first."
+}
+
+push_history() {
+	info "Uploading history to $HISTORY"
+	copy_history "$ROOT/.git" "$HISTORY"
+}
+
+fetch_history() {
+	copy_history "$HISTORY" "$ROOT/.git"
+	# The index is local only, rebuild it from HEAD
+	g rev-parse -q --verify HEAD >/dev/null && g reset -q
+	return 0
+}
+
+commit() {
+	local msg=$1
+	g add -A
+	if g diff --cached --quiet; then
+		info "No changes"
+		return 1
+	fi
+	if g config user.email >/dev/null; then
+		g commit -q -m "$msg"
+	else
+		g -c user.name="$ME" -c user.email="$ME@localhost" commit -q -m "$msg"
+	fi
+	g --no-pager show --stat --format='%h %s' HEAD
+}
+
+# Print the dry-run of an rclone sync as "+ new", "~ changed", "- deleted" lines.
+# $1/$2 are source/destination, the destination side decides what is new or changed.
+sync_preview() {
+	local src=$1 dst=$2 line file
+	rc sync "$src" "$dst" --filter-from "$FILTER" --dry-run 2>&1 |
+		while IFS= read -r line; do
+			case $line in
+				*": Skipped copy as --dry-run is set"*)
+					file=${line#*NOTICE: }
+					file=${file%%: Skipped copy*}
+					if [ -n "$(rc lsf "$dst/$file" 2>/dev/null)" ]; then
+						echo "~ $file"
+					else
+						echo "+ $file"
+					fi
+					;;
+				*": Skipped delete as --dry-run is set"*)
+					file=${line#*NOTICE: }
+					file=${file%%: Skipped delete*}
+					echo "- $file"
+					;;
+				*"ERROR"*) echo "$line" >&2 ;;
+			esac
+		done
+}
+
+confirm() {
+	local answer
+	printf '%s [y/N] ' "$1" >&2
+	read -r answer </dev/tty || return 1
+	case $answer in y | Y | yes | j | J | ja) return 0 ;; *) return 1 ;; esac
+}
+
+cmd_init() {
+	local remote="" dir="" history="" excludes=""
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--history) history=${2:?--history needs a value}; shift 2 ;;
+			--exclude) excludes="$excludes- ${2:?--exclude needs a pattern}
+"; shift 2 ;;
+			-*) die "unknown option $1" ;;
+			*)
+				if [ -z "$remote" ]; then remote=$1
+				elif [ -z "$dir" ]; then dir=$1
+				else die "too many arguments"
+				fi
+				shift
+				;;
+		esac
+	done
+	[ -n "$remote" ] || die "usage: $ME init <remote> [<dir>] [--history <remote>]"
+	case $remote in
+		*:*) ;;
+		*) [ -d "$remote" ] || die "$remote is neither an rclone remote (name:path) nor a local directory" ;;
+	esac
+	if [ -z "$dir" ]; then
+		dir=${remote%/}
+		dir=${dir##*[:/]}
+		[ -n "$dir" ] || dir=${remote%%:*}
+	fi
+	if [ -e "$dir" ] && [ -n "$(ls -A "$dir")" ]; then
+		die "$dir exists and is not empty"
+	fi
+	[ -n "$history" ] || history="${remote%/}.git-everywhere"
+
+	mkdir -p "$dir"
+	git init -q -b main "$dir"
+	ROOT=$(cd "$dir" && pwd)
+	REMOTE=$remote
+	HISTORY=$history
+	FILTER="$ROOT/.git/everywhere-filter"
+	BRANCH=main
+	g config everywhere.remote "$REMOTE"
+	g config everywhere.history "$HISTORY"
+	# Keep loose objects and refs: copying to the server never deletes, so packing would only add files
+	g config gc.auto 0
+	write_filter
+	printf '%s' "$excludes" >>"$FILTER"
+
+	if [ -n "$(rc lsf "$HISTORY/HEAD" 2>/dev/null)" ]; then
+		info "Found history in $HISTORY, downloading it"
+		fetch_history
+		BRANCH=$(g symbolic-ref --short HEAD)
+	else
+		info "Creating history in $HISTORY"
+		rc mkdir "$HISTORY"
+		# Most cheap hosting runs Apache: keep the history out of the web if it lies below the webroot
+		printf '# written by git-everywhere: the history must not be reachable from the web\nRequire all denied\n' |
+			rc rcat "$HISTORY/.htaccess"
+	fi
+
+	cd "$ROOT"
+	snapshot "Initial snapshot of $REMOTE"
+	info "Done. Local copy: $ROOT"
+	info "Excludes are in $FILTER. Change them before the history grows, see README."
+}
+
+snapshot() {
+	local msg=$1
+	check_history
+	info "Downloading changes from $REMOTE"
+	rc sync "$REMOTE" "$ROOT" --filter-from "$FILTER"
+	commit "$msg" || true
+	push_history
+}
+
+cmd_snapshot() {
+	local msg=""
+	while [ $# -gt 0 ]; do
+		case $1 in
+			-m) msg=${2:?-m needs a message}; shift 2 ;;
+			*) die "unknown argument $1" ;;
+		esac
+	done
+	load_root
+	[ -n "$msg" ] || msg="Snapshot $(date '+%Y-%m-%d %H:%M:%S')"
+	snapshot "$msg"
+}
+
+cmd_status() {
+	[ $# -eq 0 ] || die "status takes no arguments"
+	load_root
+	info "Changes on $REMOTE since the last snapshot"
+	local changes
+	changes=$(sync_preview "$REMOTE" "$ROOT")
+	if [ -z "$changes" ]; then
+		echo "nothing changed"
+	else
+		echo "$changes"
+	fi
+}
+
+cmd_restore() {
+	local rev="" yes=""
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--yes | -y) yes=1; shift ;;
+			-*) die "unknown option $1" ;;
+			*) [ -z "$rev" ] || die "too many arguments"; rev=$1; shift ;;
+		esac
+	done
+	[ -n "$rev" ] || die "usage: $ME restore <rev> [--yes]"
+	load_root
+	g rev-parse -q --verify "$rev^{commit}" >/dev/null || die "unknown revision $rev"
+	rev=$(g rev-parse --short "$rev^{commit}")
+
+	snapshot "Snapshot before restoring $rev"
+	g read-tree -u --reset "$rev"
+
+	local changes
+	changes=$(sync_preview "$ROOT" "$REMOTE")
+	if [ -z "$changes" ]; then
+		info "The server already matches $rev"
+		return 0
+	fi
+	echo "Changes on $REMOTE:"
+	echo "$changes"
+	if [ -z "$yes" ] && ! confirm "Upload these changes?"; then
+		g reset -q --hard HEAD
+		die "aborted, nothing was changed on the server"
+	fi
+	info "Uploading to $REMOTE"
+	rc sync "$ROOT" "$REMOTE" --filter-from "$FILTER"
+	commit "Restore $rev" || true
+	push_history
+}
+
+cmd_fetch() {
+	[ $# -eq 0 ] || die "fetch takes no arguments"
+	load_root
+	info "Downloading history from $HISTORY"
+	fetch_history
+	g --no-pager log --oneline -1
+}
+
+main() {
+	need git
+	need rclone
+	local cmd=${1:-help}
+	[ $# -gt 0 ] && shift
+	case $cmd in
+		init) cmd_init "$@" ;;
+		snapshot | snap) cmd_snapshot "$@" ;;
+		status | st) cmd_status "$@" ;;
+		restore) cmd_restore "$@" ;;
+		fetch) cmd_fetch "$@" ;;
+		version | --version) echo "$ME $VERSION" ;;
+		help | -h | --help) usage ;;
+		*) die "unknown command '$cmd' (see '$ME help')" ;;
+	esac
+}
+
+main "$@"
