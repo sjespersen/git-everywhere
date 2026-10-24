@@ -80,6 +80,13 @@ download the bundles and run `git fetch <bundle> main` for each of them in order
 - **Excludes should be set at `init`.** Files that are already in the history and get excluded later show up
   as deleted in copies made afterwards. Remove them from git with `git rm -r --cached <path>` when you
   change the filter.
+- **It is slow.** Every command opens new connections and lists the whole remote directory to find changes.
+  Over SFTP that is several seconds even when nothing changed, and the first snapshot downloads every file.
+  Expect minutes for a site with thousands of files. Excluding uploads, caches and other large or
+  generated folders helps most.
+- **It needs a lot of space.** Locally you keep a full copy of all files plus the git history, so at least
+  twice the size of the site, growing with every change. On the server the first bundle holds a compressed
+  copy of everything, and every snapshot adds another bundle that is never deleted.
 - **Databases are not covered.** Dump them into the directory before a snapshot if you want them versioned.
 - The history lives with the same provider as your files. It is not an off-site backup, but your local
   copy is.
