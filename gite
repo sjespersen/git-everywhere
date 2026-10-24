@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# git-everywhere: version control for directories you can only reach via SFTP, FTP, WebDAV, S3, …
+# gite (git-everywhere): version control for directories you can only reach via SFTP, FTP, WebDAV, S3, …
 #
 # All git work happens on your machine. rclone moves the files: it pulls the server state into a
-# local work tree, git commits it, and the history is copied back next to the files on the server.
-# Nothing needs to run on the server.
+# local work tree, git commits it, and the history goes back to the server as git bundles,
+# one file per snapshot. Nothing needs to run on the server.
 #
 # Works with bash 3.2 (macOS), git >= 2.28 and rclone.
 set -euo pipefail
 
-VERSION=0.1.0
+VERSION=0.2.0
 ME=$(basename "$0")
+SERVER_REF=refs/everywhere/server
 
 die() { echo "$ME: $*" >&2; exit 1; }
 info() { echo "==> $*" >&2; }
@@ -21,15 +22,15 @@ $ME $VERSION - git history for servers without git
 Usage:
   $ME init <remote> [<dir>] [--history <remote>] [--exclude <pattern>]…
                           Create a local copy of <remote> and take the first snapshot.
-                          --exclude takes rclone filter patterns, e.g. '/cache/**'.
                           <remote> is anything rclone understands, e.g. myftp:htdocs.
+                          --exclude takes rclone filter patterns, e.g. '/cache/**'.
                           If history already exists on the server, it is downloaded.
   $ME snapshot [-m <msg>] Download changes from the server and commit them.
   $ME status              Show what changed on the server since the last snapshot.
   $ME restore <rev> [--yes]
                           Put the server back to the state of commit <rev>.
                           Takes a snapshot first, shows the changes and asks before uploading.
-  $ME fetch               Download the history from the server (e.g. after using another machine).
+  $ME fetch               Download new history from the server (e.g. after using another machine).
   $ME help | version
 
 Inside the local copy, use plain git to look around: git log, git diff, git show, …
@@ -51,13 +52,6 @@ rc() {
 }
 
 g() { git -C "$ROOT" "$@"; }
-
-# Copy history between .git and the server. Files that are local only never go to the server.
-# Only adds and overwrites, never deletes.
-copy_history() {
-	rc copy "$1" "$2" --exclude /config --exclude /index --exclude '/hooks/**' --exclude '/logs/**' \
-		--exclude /COMMIT_EDITMSG --exclude /ORIG_HEAD --exclude /.htaccess
-}
 
 load_root() {
 	ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a $ME directory"
@@ -88,33 +82,98 @@ write_filter() {
 				echo "- /${rel%/}/**"
 				;;
 		esac
-		echo "# - /wp-content/uploads/**"
-		echo "# - /cache/**"
 	} >"$FILTER"
 }
 
-# Refuse to work if the server has history this copy does not contain.
+# History on the server: $HISTORY/bundles/<6-digit number>-<commit>.bundle, each holding the commits
+# since the previous one. Bundles are only ever added, never changed.
+
+# Bundle names on the server, oldest first
+list_bundles() {
+	rc lsf --files-only "$HISTORY/bundles" 2>/dev/null | grep -E '^[0-9]{6}-[0-9a-f]{40}\.bundle$' | sort || true
+}
+
+bundle_seq() { local n=${1%%-*}; echo $((10#$n)); }
+bundle_commit() { local c=${1#*-}; echo "${c%.bundle}"; }
+
+# Sets SERVER_SEQ and SERVER_TIP from the server and refuses to go on if the server has commits
+# this copy does not know.
 check_history() {
-	local remote_head
-	remote_head=$(rc cat "$HISTORY/refs/heads/$BRANCH" 2>/dev/null || true)
-	[ -z "$remote_head" ] && return 0
-	if g cat-file -e "$remote_head^{commit}" 2>/dev/null &&
-		g merge-base --is-ancestor "$remote_head" HEAD 2>/dev/null; then
+	local latest
+	latest=$(list_bundles | tail -n 1)
+	SERVER_SEQ=0 SERVER_TIP=""
+	[ -n "$latest" ] || return 0
+	SERVER_SEQ=$(bundle_seq "$latest")
+	SERVER_TIP=$(bundle_commit "$latest")
+	if g cat-file -e "$SERVER_TIP^{commit}" 2>/dev/null &&
+		g merge-base --is-ancestor "$SERVER_TIP" HEAD 2>/dev/null; then
 		return 0
 	fi
 	die "the history on the server has commits this copy does not know. Run '$ME fetch' first."
 }
 
+# Upload the commits since $SERVER_TIP as one new bundle (needs check_history first)
 push_history() {
-	info "Uploading history to $HISTORY"
-	copy_history "$ROOT/.git" "$HISTORY"
+	local tip name tmp
+	tip=$(g rev-parse -q --verify HEAD) || return 0
+	[ "$tip" != "$SERVER_TIP" ] || return 0
+	name=$(printf '%06d-%s.bundle' $((SERVER_SEQ + 1)) "$tip")
+	tmp="$ROOT/.git/everywhere-upload.bundle"
+	if [ -n "$SERVER_TIP" ]; then
+		g bundle create -q "$tmp" "$BRANCH" "^$SERVER_TIP"
+	else
+		g bundle create -q "$tmp" "$BRANCH"
+	fi
+	info "Uploading history to $HISTORY/bundles/$name"
+	rc copyto "$tmp" "$HISTORY/bundles/$name"
+	rm -f "$tmp"
+	g update-ref "$SERVER_REF" "$tip"
+	SERVER_SEQ=$((SERVER_SEQ + 1)) SERVER_TIP=$tip
+	# Share the filter, but only upload it when it changed
+	if ! cmp -s "$FILTER" "$ROOT/.git/everywhere-filter.uploaded"; then
+		rc copyto "$FILTER" "$HISTORY/everywhere-filter"
+		cp "$FILTER" "$ROOT/.git/everywhere-filter.uploaded"
+	fi
 }
 
+# Download and import the bundles this copy does not have yet
 fetch_history() {
-	copy_history "$HISTORY" "$ROOT/.git"
-	# The index is local only, rebuild it from HEAD
-	g rev-parse -q --verify HEAD >/dev/null && g reset -q
-	return 0
+	local known bundles name new="" tmp
+	known=$(g rev-parse -q --verify "$SERVER_REF" || true)
+	bundles=$(list_bundles)
+	[ -n "$bundles" ] || { info "No history on the server"; return 0; }
+	for name in $bundles; do
+		if [ -n "$known" ] && g merge-base --is-ancestor "$(bundle_commit "$name")" "$known" 2>/dev/null; then
+			continue
+		fi
+		new="$new$name
+"
+	done
+	[ -n "$new" ] || { info "History is up to date"; return 0; }
+
+	tmp="$ROOT/.git/everywhere-download"
+	rm -rf "$tmp"
+	mkdir -p "$tmp"
+	printf '%s' "$new" | rc copy "$HISTORY/bundles" "$tmp" --files-from-raw -
+	rc copyto "$HISTORY/everywhere-filter" "$FILTER" 2>/dev/null &&
+		cp "$FILTER" "$ROOT/.git/everywhere-filter.uploaded" || true
+	for name in $new; do
+		g fetch -q "$tmp/$name" "refs/heads/$BRANCH:$SERVER_REF" ||
+			die "could not import $name"
+	done
+	rm -rf "$tmp"
+	info "Imported $(printf '%s' "$new" | grep -c .) bundle(s)"
+
+	# Move the branch forward to the server state. The work tree stays as it is,
+	# the next snapshot brings it up to date.
+	if ! g rev-parse -q --verify HEAD >/dev/null; then
+		g update-ref "refs/heads/$BRANCH" "$SERVER_REF"
+		g reset -q
+	elif g merge-base --is-ancestor HEAD "$SERVER_REF"; then
+		g reset -q "$SERVER_REF"
+	elif ! g merge-base --is-ancestor "$SERVER_REF" HEAD; then
+		die "this copy has commits that are not on the server and the server has commits that are not here. Resolve with git (e.g. 'git reset $SERVER_REF')."
+	fi
 }
 
 commit() {
@@ -133,16 +192,18 @@ commit() {
 }
 
 # Print the dry-run of an rclone sync as "+ new", "~ changed", "- deleted" lines.
-# $1/$2 are source/destination, the destination side decides what is new or changed.
+# $3 tells where to look whether a file already exists in the destination:
+# "local" (the work tree) or "head" (the last commit, i.e. the server state at the last snapshot).
 sync_preview() {
-	local src=$1 dst=$2 line file
+	local src=$1 dst=$2 where=$3 line file
 	rc sync "$src" "$dst" --filter-from "$FILTER" --dry-run 2>&1 |
 		while IFS= read -r line; do
 			case $line in
 				*": Skipped copy as --dry-run is set"*)
 					file=${line#*NOTICE: }
 					file=${file%%: Skipped copy*}
-					if [ -n "$(rc lsf "$dst/$file" 2>/dev/null)" ]; then
+					if { [ "$where" = local ] && [ -e "$ROOT/$file" ]; } ||
+						{ [ "$where" = head ] && g cat-file -e "HEAD:$file" 2>/dev/null; }; then
 						echo "~ $file"
 					else
 						echo "+ $file"
@@ -182,7 +243,7 @@ cmd_init() {
 				;;
 		esac
 	done
-	[ -n "$remote" ] || die "usage: $ME init <remote> [<dir>] [--history <remote>]"
+	[ -n "$remote" ] || die "usage: $ME init <remote> [<dir>] [--history <remote>] [--exclude <pattern>]"
 	case $remote in
 		*:*) ;;
 		*) [ -d "$remote" ] || die "$remote is neither an rclone remote (name:path) nor a local directory" ;;
@@ -206,20 +267,17 @@ cmd_init() {
 	BRANCH=main
 	g config everywhere.remote "$REMOTE"
 	g config everywhere.history "$HISTORY"
-	# Keep loose objects and refs: copying to the server never deletes, so packing would only add files
-	g config gc.auto 0
 	write_filter
 	printf '%s' "$excludes" >>"$FILTER"
 
-	if [ -n "$(rc lsf "$HISTORY/HEAD" 2>/dev/null)" ]; then
+	if [ -n "$(list_bundles)" ]; then
 		info "Found history in $HISTORY, downloading it"
+		[ -z "$excludes" ] || info "Using the excludes stored on the server, --exclude is ignored"
 		fetch_history
-		BRANCH=$(g symbolic-ref --short HEAD)
 	else
 		info "Creating history in $HISTORY"
-		rc mkdir "$HISTORY"
 		# Most cheap hosting runs Apache: keep the history out of the web if it lies below the webroot
-		printf '# written by git-everywhere: the history must not be reachable from the web\nRequire all denied\n' |
+		printf '# written by gite (git-everywhere): the history must not be reachable from the web\nRequire all denied\n' |
 			rc rcat "$HISTORY/.htaccess"
 	fi
 
@@ -256,7 +314,7 @@ cmd_status() {
 	load_root
 	info "Changes on $REMOTE since the last snapshot"
 	local changes
-	changes=$(sync_preview "$REMOTE" "$ROOT")
+	changes=$(sync_preview "$REMOTE" "$ROOT" local)
 	if [ -z "$changes" ]; then
 		echo "nothing changed"
 	else
@@ -282,7 +340,7 @@ cmd_restore() {
 	g read-tree -u --reset "$rev"
 
 	local changes
-	changes=$(sync_preview "$ROOT" "$REMOTE")
+	changes=$(sync_preview "$ROOT" "$REMOTE" head)
 	if [ -z "$changes" ]; then
 		info "The server already matches $rev"
 		return 0

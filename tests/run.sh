@@ -3,7 +3,7 @@
 # Usage: tests/run.sh   (needs git and rclone)
 set -euo pipefail
 
-GE="$(cd "$(dirname "$0")/.." && pwd)/git-everywhere"
+GE="$(cd "$(dirname "$0")/.." && pwd)/gite"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -30,9 +30,9 @@ echo "tmp" >"$SERVER/cache/x"
 cd "$TMP"
 "$GE" init "$SERVER" site --exclude '/cache/**' >/dev/null 2>&1
 check "init creates local copy" test -f site/index.php
-check "init writes history next to the server dir" test -f "$SERVER.git-everywhere/HEAD"
+check "init writes history next to the server dir" test -n "$(ls "$SERVER.git-everywhere/bundles/"000001-*.bundle)"
 check "history is protected by .htaccess" grep -q "Require all denied" "$SERVER.git-everywhere/.htaccess"
-check "local config does not go to the server" test ! -e "$SERVER.git-everywhere/config"
+check "filter is shared via the server" test -f "$SERVER.git-everywhere/everywhere-filter"
 same "initial commit" 1 "$(git -C site rev-list --count HEAD)"
 first=$(git -C site rev-parse HEAD)
 
@@ -54,6 +54,7 @@ same "snapshot commits" 2 "$(git rev-list --count HEAD)"
 same "snapshot message" "second" "$(git log -1 --format=%s)"
 "$GE" snapshot >/dev/null 2>&1
 same "no empty commits" 2 "$(git rev-list --count HEAD)"
+same "one bundle per snapshot" 2 "$(ls "$SERVER.git-everywhere/bundles" | wc -l | tr -d ' ')"
 
 # Restore the first state on the server
 "$GE" restore "$first" --yes >/dev/null 2>&1
@@ -68,6 +69,7 @@ cd ..
 "$GE" init "$SERVER" second >/dev/null 2>&1
 same "second copy sees the whole history" "$(git -C site rev-parse HEAD)" "$(git -C second rev-parse HEAD)"
 check "second copy has a clean work tree" test -z "$(git -C second status --porcelain)"
+check "second copy got the shared filter" grep -q "/cache/" second/.git/everywhere-filter
 
 # The first copy is now behind if the second one commits
 echo "from second" >"$SERVER/second.txt"
