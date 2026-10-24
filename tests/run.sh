@@ -84,5 +84,27 @@ fi
 same "after fetch the outdated copy can continue" "$(git -C site rev-list --count HEAD)" \
 	"$(($(git -C second rev-list --count HEAD) + 1))"
 
+# Uninstall from the second copy, which is behind the server at this point
+if (cd second && "$GE" uninstall --yes >/dev/null 2>&1); then
+	fail "outdated copy must refuse to uninstall"
+else
+	ok "outdated copy refuses to uninstall"
+fi
+check "refused uninstall keeps the history on the server" test -d "$SERVER.git-everywhere/bundles"
+(cd second && "$GE" fetch >/dev/null 2>&1 && "$GE" uninstall --yes >/dev/null 2>&1)
+check "uninstall deletes the history on the server" test ! -e "$SERVER.git-everywhere"
+check "uninstall leaves the files on the server" test -f "$SERVER/index.php"
+check "uninstall keeps the local history" test "$(git -C second rev-list --count HEAD)" -gt 1
+check "uninstall turns the copy into a plain git repository" test -z "$(git -C second config --get everywhere.remote || true)"
+if (cd second && "$GE" status >/dev/null 2>&1); then fail "gite must not work after uninstall"; else ok "gite does not work after uninstall"; fi
+
+# The other copy can bring the history back with a full bundle
+(cd site && "$GE" snapshot >/dev/null 2>&1)
+check "recreated history is protected by .htaccess" test -f "$SERVER.git-everywhere/.htaccess"
+check "recreated history has the filter" test -f "$SERVER.git-everywhere/everywhere-filter"
+same "snapshot after uninstall writes one full bundle" 1 "$(ls "$SERVER.git-everywhere/bundles" | wc -l | tr -d ' ')"
+"$GE" init "$SERVER" third >/dev/null 2>&1
+same "the restored history is complete" "$(git -C site rev-list --count HEAD)" "$(git -C third rev-list --count HEAD)"
+
 echo
 if [ "$FAILS" -eq 0 ]; then echo "all tests passed"; else echo "$FAILS test(s) failed"; exit 1; fi

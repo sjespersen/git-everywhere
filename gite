@@ -8,7 +8,7 @@
 # Works with bash 3.2 (macOS), git >= 2.28 and rclone.
 set -euo pipefail
 
-VERSION=0.2.0
+VERSION=0.3.0
 ME=$(basename "$0")
 SERVER_REF=refs/everywhere/server
 
@@ -31,6 +31,8 @@ Usage:
                           Put the server back to the state of commit <rev>.
                           Takes a snapshot first, shows the changes and asks before uploading.
   $ME fetch               Download new history from the server (e.g. after using another machine).
+  $ME uninstall [--yes]   Delete the history from the server. Your files there stay untouched,
+                          the local copy stays as a plain git repository with the full history.
   $ME help | version
 
 Inside the local copy, use plain git to look around: git log, git diff, git show, …
@@ -117,6 +119,13 @@ push_history() {
 	local tip name tmp
 	tip=$(g rev-parse -q --verify HEAD) || return 0
 	[ "$tip" != "$SERVER_TIP" ] || return 0
+	if [ -z "$SERVER_TIP" ]; then
+		info "Creating history in $HISTORY"
+		# Most cheap hosting runs Apache: keep the history out of the web if it lies below the webroot
+		printf '# written by gite (git-everywhere): the history must not be reachable from the web\nRequire all denied\n' |
+			rc rcat "$HISTORY/.htaccess"
+		rm -f "$FILTER.uploaded"
+	fi
 	name=$(printf '%06d-%s.bundle' $((SERVER_SEQ + 1)) "$tip")
 	tmp="$ROOT/.git/everywhere-upload.bundle"
 	if [ -n "$SERVER_TIP" ]; then
@@ -130,9 +139,9 @@ push_history() {
 	g update-ref "$SERVER_REF" "$tip"
 	SERVER_SEQ=$((SERVER_SEQ + 1)) SERVER_TIP=$tip
 	# Share the filter, but only upload it when it changed
-	if ! cmp -s "$FILTER" "$ROOT/.git/everywhere-filter.uploaded"; then
+	if ! cmp -s "$FILTER" "$FILTER.uploaded" 2>/dev/null; then
 		rc copyto "$FILTER" "$HISTORY/everywhere-filter"
-		cp "$FILTER" "$ROOT/.git/everywhere-filter.uploaded"
+		cp "$FILTER" "$FILTER.uploaded"
 	fi
 }
 
@@ -156,7 +165,7 @@ fetch_history() {
 	mkdir -p "$tmp"
 	printf '%s' "$new" | rc copy "$HISTORY/bundles" "$tmp" --files-from-raw -
 	rc copyto "$HISTORY/everywhere-filter" "$FILTER" 2>/dev/null &&
-		cp "$FILTER" "$ROOT/.git/everywhere-filter.uploaded" || true
+		cp "$FILTER" "$FILTER.uploaded" || true
 	for name in $new; do
 		g fetch -q "$tmp/$name" "refs/heads/$BRANCH:$SERVER_REF" ||
 			die "could not import $name"
@@ -274,11 +283,6 @@ cmd_init() {
 		info "Found history in $HISTORY, downloading it"
 		[ -z "$excludes" ] || info "Using the excludes stored on the server, --exclude is ignored"
 		fetch_history
-	else
-		info "Creating history in $HISTORY"
-		# Most cheap hosting runs Apache: keep the history out of the web if it lies below the webroot
-		printf '# written by gite (git-everywhere): the history must not be reachable from the web\nRequire all denied\n' |
-			rc rcat "$HISTORY/.htaccess"
 	fi
 
 	cd "$ROOT"
@@ -365,6 +369,38 @@ cmd_fetch() {
 	g --no-pager log --oneline -1
 }
 
+cmd_uninstall() {
+	local yes=""
+	while [ $# -gt 0 ]; do
+		case $1 in
+			--yes | -y) yes=1; shift ;;
+			*) die "unknown argument $1" ;;
+		esac
+	done
+	load_root
+	# Refuses if the server has commits this copy does not have, so no history gets lost
+	check_history
+
+	if [ -n "$(rc lsf "$HISTORY" 2>/dev/null)" ]; then
+		echo "This deletes $HISTORY from the server ($SERVER_SEQ bundle(s), $(rc size "$HISTORY" 2>/dev/null |
+			sed -n 's/^Total size: \([^(]*\).*/\1/p' | sed 's/ *$//'))."
+		echo "Your files in $REMOTE are not touched."
+		echo "$ROOT stays as a plain git repository with the full history."
+		if [ -z "$yes" ] && ! confirm "Delete the history on the server?"; then
+			die "aborted, nothing was deleted"
+		fi
+		info "Deleting $HISTORY"
+		rc purge "$HISTORY"
+	else
+		info "No history on the server"
+	fi
+
+	g config --remove-section everywhere 2>/dev/null || true
+	g update-ref -d "$SERVER_REF" 2>/dev/null || true
+	rm -f "$FILTER" "$FILTER.uploaded"
+	info "Done. $ROOT is now a plain git repository. Delete it with: rm -rf '$ROOT'"
+}
+
 main() {
 	need git
 	need rclone
@@ -376,6 +412,7 @@ main() {
 		status | st) cmd_status "$@" ;;
 		restore) cmd_restore "$@" ;;
 		fetch) cmd_fetch "$@" ;;
+		uninstall) cmd_uninstall "$@" ;;
 		version | --version) echo "$ME $VERSION" ;;
 		help | -h | --help) usage ;;
 		*) die "unknown command '$cmd' (see '$ME help')" ;;

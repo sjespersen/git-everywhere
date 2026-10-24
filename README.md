@@ -49,6 +49,7 @@ gite restore HEAD~1            # put the server back, asks before uploading
 | `status` | Show changed (`~`), new (`+`) and deleted (`-`) files on the server. |
 | `restore <rev> [--yes]` | Take a snapshot, then make the server match `<rev>`. Shows the changes and asks first. The restore is a new commit, nothing is lost. |
 | `fetch` | Download new history, e.g. when you also work from another machine. |
+| `uninstall [--yes]` | Delete the history from the server after asking. Your files there are not touched. The local copy stays as a plain git repository with the full history; delete its folder if you no longer need it. Refuses if the server has commits your copy does not have (`fetch` first). |
 
 Extra rclone flags go into `RCLONE_FLAGS`, e.g. `RCLONE_FLAGS="--checksum -v" gite snapshot`.
 
