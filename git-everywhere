@@ -5,12 +5,15 @@
 # local work tree, git commits it, and the history goes back to the server as git bundles,
 # one file per snapshot. Nothing needs to run on the server.
 #
-# Works with bash 3.2 (macOS), git >= 2.28 and rclone.
+# Works with bash 3.2 (macOS), git >= 2.28 and rclone >= 1.66.
 set -euo pipefail
 
-VERSION=0.3.0
+VERSION=0.4.0
 ME=$(basename "$0")
 SERVER_REF=refs/everywhere/server
+# Marker file in the history folder. rclone skips folders containing it, so the history is never
+# downloaded, versioned or deleted, even when it lies inside the synced directory.
+MARKER=.git-everywhere-history
 
 die() { echo "$ME: $*" >&2; exit 1; }
 info() { echo "==> $*" >&2; }
@@ -54,6 +57,11 @@ rc() {
 	rclone ${RCLONE_FLAGS:-} "$@"
 }
 
+# rclone sync between the server and the work tree, with the filters that protect .git and the history
+rc_sync() {
+	rc sync "$1" "$2" --filter-from "$FILTER" --exclude-if-present "$MARKER" "${@:3}"
+}
+
 g() { git -C "$ROOT" "$@"; }
 
 load_root() {
@@ -61,39 +69,42 @@ load_root() {
 	REMOTE=$(g config --get everywhere.remote) || die "$ROOT is not a $ME directory (see '$ME init')"
 	HISTORY=$(g config --get everywhere.history) || die "everywhere.history is not set in $ROOT/.git/config"
 	FILTER="$ROOT/.git/everywhere-filter"
-	BRANCH=$(g symbolic-ref --short HEAD)
-}
-
-# Prefix that paths below $REMOTE start with ("host:" stays, "host:dir" becomes "host:dir/")
-remote_prefix() {
-	case $REMOTE in
-		*: | */) echo "$REMOTE" ;;
-		*) echo "$REMOTE/" ;;
-	esac
+	BRANCH=$(g symbolic-ref -q --short HEAD) ||
+		die "an old commit is checked out. Go back to your branch first, e.g. 'git checkout main'."
 }
 
 write_filter() {
 	{
 		echo "# rclone filter rules (https://rclone.org/filtering/), used for downloads and uploads."
 		echo "# Excluded files are neither versioned nor touched on the server."
-		echo "- /.git/**"
-		local prefix rel
-		prefix=$(remote_prefix)
-		case $HISTORY in
-			"$prefix"*)
-				rel=${HISTORY#"$prefix"}
-				echo "- /${rel%/}/**"
-				;;
-		esac
+		echo "# .git on any level: this copy's repository and git repositories on the server"
+		echo "- .git/**"
+		echo "- .git"
 	} >"$FILTER"
+}
+
+# Make git store every file exactly as it is: no line ending conversion, no LFS or other filters,
+# no ignore files. The history must be able to restore the server byte for byte.
+configure_git() {
+	g config core.autocrlf false
+	g config core.safecrlf false
+	g config core.symlinks true
+	printf '* -text -filter -ident !eol !working-tree-encoding\n' >"$ROOT/.git/info/attributes"
 }
 
 # History on the server: $HISTORY/bundles/<6-digit number>-<commit>.bundle, each holding the commits
 # since the previous one. Bundles are only ever added, never changed.
 
-# Bundle names on the server, oldest first
+# Bundle names on the server, oldest first. A missing folder means no history, other errors stop.
 list_bundles() {
-	rc lsf --files-only "$HISTORY/bundles" 2>/dev/null | grep -E '^[0-9]{6}-[0-9a-f]{40}\.bundle$' | sort || true
+	local out code=0
+	out=$(rc lsf --files-only "$HISTORY/bundles" 2>&1) || code=$?
+	case $code in
+		0) ;;
+		3) return 0 ;;
+		*) echo "$out" >&2; die "could not list $HISTORY/bundles" ;;
+	esac
+	printf '%s\n' "$out" | grep -E '^[0-9]{6}-([0-9a-f]{40}|[0-9a-f]{64})\.bundle$' | sort || true
 }
 
 bundle_seq() { local n=${1%%-*}; echo $((10#$n)); }
@@ -102,12 +113,17 @@ bundle_commit() { local c=${1#*-}; echo "${c%.bundle}"; }
 # Sets SERVER_SEQ and SERVER_TIP from the server and refuses to go on if the server has commits
 # this copy does not know.
 check_history() {
-	local latest
-	latest=$(list_bundles | tail -n 1)
+	local bundles latest same
+	bundles=$(list_bundles)
 	SERVER_SEQ=0 SERVER_TIP=""
-	[ -n "$latest" ] || return 0
+	[ -n "$bundles" ] || return 0
+	latest=$(printf '%s\n' "$bundles" | tail -n 1)
 	SERVER_SEQ=$(bundle_seq "$latest")
 	SERVER_TIP=$(bundle_commit "$latest")
+	same=$(printf '%s\n' "$bundles" | grep -c "^${latest%%-*}-" || true)
+	if [ "$same" -gt 1 ]; then
+		die "two copies wrote history at the same time: there are $same bundles numbered ${latest%%-*} in $HISTORY/bundles. Run '$ME fetch', keep the history you want with git, then delete the other bundle on the server."
+	fi
 	if g cat-file -e "$SERVER_TIP^{commit}" 2>/dev/null &&
 		g merge-base --is-ancestor "$SERVER_TIP" HEAD 2>/dev/null; then
 		return 0
@@ -115,43 +131,64 @@ check_history() {
 	die "the history on the server has commits this copy does not know. Run '$ME fetch' first."
 }
 
+create_history() {
+	info "Creating history in $HISTORY"
+	printf 'This folder holds the history of git-everywhere. Do not delete it while you use git-everywhere.\n' |
+		rc rcat "$HISTORY/$MARKER"
+	# Most cheap hosting runs Apache: keep the history out of the web if it lies below the webroot
+	printf '# written by git-everywhere: the history must not be reachable from the web\nRequire all denied\n' |
+		rc rcat "$HISTORY/.htaccess"
+	rm -f "$FILTER.uploaded"
+}
+
 # Upload the commits since $SERVER_TIP as one new bundle (needs check_history first)
 push_history() {
 	local tip name tmp
 	tip=$(g rev-parse -q --verify HEAD) || return 0
-	[ "$tip" != "$SERVER_TIP" ] || return 0
-	if [ -z "$SERVER_TIP" ]; then
-		info "Creating history in $HISTORY"
-		# Most cheap hosting runs Apache: keep the history out of the web if it lies below the webroot
-		printf '# written by git-everywhere: the history must not be reachable from the web\nRequire all denied\n' |
-			rc rcat "$HISTORY/.htaccess"
-		rm -f "$FILTER.uploaded"
+	if [ "$tip" != "$SERVER_TIP" ]; then
+		[ -n "$SERVER_TIP" ] || create_history
+		name=$(printf '%06d-%s.bundle' $((SERVER_SEQ + 1)) "$tip")
+		tmp="$ROOT/.git/everywhere-upload.bundle"
+		if [ -n "$SERVER_TIP" ]; then
+			g bundle create -q "$tmp" "$BRANCH" "^$SERVER_TIP"
+		else
+			g bundle create -q "$tmp" "$BRANCH"
+		fi
+		info "Uploading history to $HISTORY/bundles/$name"
+		# Upload under a temporary name and rename, so an interrupted upload never looks like a bundle
+		rc copyto "$tmp" "$HISTORY/bundles/$name.partial"
+		rc moveto "$HISTORY/bundles/$name.partial" "$HISTORY/bundles/$name"
+		rm -f "$tmp"
+		g update-ref "$SERVER_REF" "$tip"
+		SERVER_SEQ=$((SERVER_SEQ + 1)) SERVER_TIP=$tip
 	fi
-	name=$(printf '%06d-%s.bundle' $((SERVER_SEQ + 1)) "$tip")
-	tmp="$ROOT/.git/everywhere-upload.bundle"
-	if [ -n "$SERVER_TIP" ]; then
-		g bundle create -q "$tmp" "$BRANCH" "^$SERVER_TIP"
-	else
-		g bundle create -q "$tmp" "$BRANCH"
-	fi
-	info "Uploading history to $HISTORY/bundles/$name"
-	rc copyto "$tmp" "$HISTORY/bundles/$name"
-	rm -f "$tmp"
-	g update-ref "$SERVER_REF" "$tip"
-	SERVER_SEQ=$((SERVER_SEQ + 1)) SERVER_TIP=$tip
 	# Share the filter, but only upload it when it changed
-	if ! cmp -s "$FILTER" "$FILTER.uploaded" 2>/dev/null; then
+	if [ -n "$SERVER_TIP" ] && ! cmp -s "$FILTER" "$FILTER.uploaded" 2>/dev/null; then
 		rc copyto "$FILTER" "$HISTORY/everywhere-filter"
 		cp "$FILTER" "$FILTER.uploaded"
 	fi
 }
 
+# Take the shared filter from the server unless it was changed here and not uploaded yet
+fetch_filter() {
+	if [ -f "$FILTER.uploaded" ] && ! cmp -s "$FILTER" "$FILTER.uploaded"; then
+		info "Keeping your changes to $FILTER, they will be uploaded with the next snapshot"
+		return 0
+	fi
+	if rc copyto "$HISTORY/everywhere-filter" "$FILTER.new" 2>/dev/null && [ -f "$FILTER.new" ]; then
+		mv "$FILTER.new" "$FILTER"
+		cp "$FILTER" "$FILTER.uploaded"
+	fi
+	rm -f "$FILTER.new"
+}
+
 # Download and import the bundles this copy does not have yet
 fetch_history() {
-	local known bundles name new="" tmp
+	local known bundles name new="" tmp ref
 	known=$(g rev-parse -q --verify "$SERVER_REF" || true)
 	bundles=$(list_bundles)
 	[ -n "$bundles" ] || { info "No history on the server"; return 0; }
+	fetch_filter
 	for name in $bundles; do
 		if [ -n "$known" ] && g merge-base --is-ancestor "$(bundle_commit "$name")" "$known" 2>/dev/null; then
 			continue
@@ -165,11 +202,11 @@ fetch_history() {
 	rm -rf "$tmp"
 	mkdir -p "$tmp"
 	printf '%s' "$new" | rc copy "$HISTORY/bundles" "$tmp" --files-from-raw -
-	rc copyto "$HISTORY/everywhere-filter" "$FILTER" 2>/dev/null &&
-		cp "$FILTER" "$FILTER.uploaded" || true
 	for name in $new; do
-		g fetch -q "$tmp/$name" "refs/heads/$BRANCH:$SERVER_REF" ||
-			die "could not import $name"
+		# Take whatever branch the bundle was written from
+		ref=$(g bundle list-heads "$tmp/$name" | awk 'NR == 1 { print $2 }')
+		[ -n "$ref" ] || die "$name is damaged or contains no branch"
+		g fetch -q "$tmp/$name" "+$ref:$SERVER_REF" || die "could not import $name"
 	done
 	rm -rf "$tmp"
 	info "Imported $(printf '%s' "$new" | grep -c .) bundle(s)"
@@ -188,56 +225,61 @@ fetch_history() {
 
 commit() {
 	local msg=$1
-	g add -A
+	# -f: also files that .gitignore files on the server or the user's global ignore list match
+	g add -A -f
 	if g diff --cached --quiet; then
 		info "No changes"
 		return 1
 	fi
 	if g config user.email >/dev/null; then
-		g commit -q -m "$msg"
+		g commit -q --no-verify -m "$msg"
 	else
-		g -c user.name="$ME" -c user.email="$ME@localhost" commit -q -m "$msg"
+		g -c user.name="$ME" -c user.email="$ME@localhost" commit -q --no-verify -m "$msg"
 	fi
 	g --no-pager show --stat --format='%h %s' HEAD
 }
 
-# Print the dry-run of an rclone sync as "+ new", "~ changed", "- deleted" lines.
-# $3 tells where to look whether a file already exists in the destination:
-# "local" (the work tree) or "head" (the last commit, i.e. the server state at the last snapshot).
+# Print what an rclone sync from $1 to $2 would do: "+ new", "~ changed", "- deleted"
 sync_preview() {
-	local src=$1 dst=$2 where=$3 line file
-	rc sync "$src" "$dst" --filter-from "$FILTER" --dry-run 2>&1 |
+	local src=$1 dst=$2 err line
+	err="$ROOT/.git/everywhere-preview.log"
+	if ! rc_sync "$src" "$dst" --dry-run --combined - 2>"$err" |
 		while IFS= read -r line; do
 			case $line in
-				*": Skipped copy as --dry-run is set"*)
-					file=${line#*NOTICE: }
-					file=${file%%: Skipped copy*}
-					if { [ "$where" = local ] && [ -e "$ROOT/$file" ]; } ||
-						{ [ "$where" = head ] && g cat-file -e "HEAD:$file" 2>/dev/null; }; then
-						echo "~ $file"
-					else
-						echo "+ $file"
-					fi
-					;;
-				*": Skipped delete as --dry-run is set"*)
-					file=${line#*NOTICE: }
-					file=${file%%: Skipped delete*}
-					echo "- $file"
-					;;
-				*"ERROR"*) echo "$line" >&2 ;;
+				"+ "* | "- "*) echo "$line" ;;
+				"* "*) echo "~ ${line#\* }" ;;
+				"! "*) echo "$line" >&2 ;;
 			esac
-		done
+		done; then
+		cat "$err" >&2
+		rm -f "$err"
+		die "could not compare $src with $dst"
+	fi
+	rm -f "$err"
 }
 
 confirm() {
 	local answer
 	printf '%s [y/N] ' "$1" >&2
-	read -r answer </dev/tty || return 1
+	read -r answer || return 1
 	case $answer in y | Y | yes | j | J | ja) return 0 ;; *) return 1 ;; esac
 }
 
+# Turn a local path into an absolute one, rclone remotes (name:path) stay as they are
+absolute() {
+	case $1 in
+		*:*) echo "$1" ;;
+		*)
+			local parent base
+			parent=$(dirname "$1") base=$(basename "$1")
+			parent=$(cd "$parent" 2>/dev/null && pwd) || die "folder $(dirname "$1") does not exist"
+			echo "${parent%/}/$base"
+			;;
+	esac
+}
+
 cmd_init() {
-	local remote="" dir="" history="" excludes=""
+	local remote="" dir="" history="" excludes="" existing existed=""
 	while [ $# -gt 0 ]; do
 		case $1 in
 			--history) history=${2:?--history needs a value}; shift 2 ;;
@@ -258,29 +300,50 @@ cmd_init() {
 		*:*) ;;
 		*) [ -d "$remote" ] || die "$remote is neither an rclone remote (name:path) nor a local directory" ;;
 	esac
+	remote=$(absolute "$remote")
 	if [ -z "$dir" ]; then
 		dir=${remote%/}
 		dir=${dir##*[:/]}
 		[ -n "$dir" ] || dir=${remote%%:*}
 	fi
-	if [ -e "$dir" ] && [ -n "$(ls -A "$dir")" ]; then
-		die "$dir exists and is not empty"
+	if [ -e "$dir" ]; then
+		[ -z "$(ls -A "$dir")" ] || die "$dir exists and is not empty"
+		existed=1
 	fi
 	[ -n "$history" ] || history="${remote%/}.git-everywhere"
+	history=$(absolute "$history")
+
+	# The history must not contain the files: uninstall deletes the history
+	local r=${remote%/} h=${history%/}
+	case $r/ in
+		"$h"/*) die "--history must not be the synced folder or contain it" ;;
+	esac
+	case $h in
+		*:) die "--history must not be the root of a remote" ;;
+	esac
 
 	mkdir -p "$dir"
-	git init -q -b main "$dir"
 	ROOT=$(cd "$dir" && pwd)
+	# Do not leave a half-made copy behind if something fails
+	if [ -n "$existed" ]; then
+		trap 'find "$ROOT" -mindepth 1 -delete 2>/dev/null' EXIT
+	else
+		trap 'rm -rf "$ROOT"' EXIT
+	fi
+	# Bundle names and checks assume sha1, whatever the user's default is
+	GIT_DEFAULT_HASH=sha1 git init -q -b main "$ROOT"
 	REMOTE=$remote
 	HISTORY=$history
 	FILTER="$ROOT/.git/everywhere-filter"
 	BRANCH=main
 	g config everywhere.remote "$REMOTE"
 	g config everywhere.history "$HISTORY"
+	configure_git
 	write_filter
 	printf '%s' "$excludes" >>"$FILTER"
 
-	if [ -n "$(list_bundles)" ]; then
+	existing=$(list_bundles)
+	if [ -n "$existing" ]; then
 		info "Found history in $HISTORY, downloading it"
 		[ -z "$excludes" ] || info "Using the excludes stored on the server, --exclude is ignored"
 		fetch_history
@@ -288,17 +351,20 @@ cmd_init() {
 
 	cd "$ROOT"
 	snapshot "Initial snapshot of $REMOTE"
+	trap - EXIT
 	info "Done. Local copy: $ROOT"
 	info "Excludes are in $FILTER. Change them before the history grows, see README."
 }
 
 snapshot() {
-	local msg=$1
+	local msg=$1 failed=""
 	check_history
 	info "Downloading changes from $REMOTE"
-	rc sync "$REMOTE" "$ROOT" --filter-from "$FILTER"
+	rc_sync "$REMOTE" "$ROOT" || failed=1
 	commit "$msg" || true
 	push_history
+	[ -z "$failed" ] ||
+		die "some files could not be downloaded (see above). Everything else was saved. Exclude files that can never be read."
 }
 
 cmd_snapshot() {
@@ -319,7 +385,7 @@ cmd_status() {
 	load_root
 	info "Changes on $REMOTE since the last snapshot"
 	local changes
-	changes=$(sync_preview "$REMOTE" "$ROOT" local)
+	changes=$(sync_preview "$REMOTE" "$ROOT")
 	if [ -z "$changes" ]; then
 		echo "nothing changed"
 	else
@@ -345,8 +411,9 @@ cmd_restore() {
 	g read-tree -u --reset "$rev"
 
 	local changes
-	changes=$(sync_preview "$ROOT" "$REMOTE" head)
+	changes=$(sync_preview "$ROOT" "$REMOTE") || { g reset -q --hard HEAD; exit 1; }
 	if [ -z "$changes" ]; then
+		g reset -q --hard HEAD
 		info "The server already matches $rev"
 		return 0
 	fi
@@ -357,7 +424,7 @@ cmd_restore() {
 		die "aborted, nothing was changed on the server"
 	fi
 	info "Uploading to $REMOTE"
-	rc sync "$ROOT" "$REMOTE" --filter-from "$FILTER"
+	rc_sync "$ROOT" "$REMOTE"
 	commit "Restore $rev" || true
 	push_history
 }
@@ -371,7 +438,7 @@ cmd_fetch() {
 }
 
 cmd_uninstall() {
-	local yes=""
+	local yes="" size
 	while [ $# -gt 0 ]; do
 		case $1 in
 			--yes | -y) yes=1; shift ;;
@@ -382,16 +449,25 @@ cmd_uninstall() {
 	# Refuses if the server has commits this copy does not have, so no history gets lost
 	check_history
 
-	if [ -n "$(rc lsf "$HISTORY" 2>/dev/null)" ]; then
-		echo "This deletes $HISTORY from the server ($SERVER_SEQ bundle(s), $(rc size "$HISTORY" 2>/dev/null |
-			sed -n 's/^Total size: \([^(]*\).*/\1/p' | sed 's/ *$//'))."
+	if [ "$SERVER_SEQ" -gt 0 ]; then
+		size=$(rc size "$HISTORY/bundles" 2>/dev/null | sed -n 's/^Total size: \([^(]*\).*/\1/p' | sed 's/ *$//')
+		echo "This deletes the history in $HISTORY from the server ($SERVER_SEQ bundle(s), $size)."
 		echo "Your files in $REMOTE are not touched."
 		echo "$ROOT stays as a plain git repository with the full history."
 		if [ -z "$yes" ] && ! confirm "Delete the history on the server?"; then
 			die "aborted, nothing was deleted"
 		fi
-		info "Deleting $HISTORY"
-		rc purge "$HISTORY"
+		info "Deleting the history in $HISTORY"
+		# Only delete what git-everywhere wrote, never the whole folder
+		rc delete "$HISTORY/bundles" --include '/[0-9][0-9][0-9][0-9][0-9][0-9]-*.bundle' --include '/*.bundle.partial'
+		local f
+		for f in everywhere-filter .htaccess "$MARKER"; do
+			rc deletefile "$HISTORY/$f" 2>/dev/null || true
+		done
+		rc rmdirs "$HISTORY" 2>/dev/null || true
+		if [ -n "$(rc lsf "$HISTORY" 2>/dev/null)" ]; then
+			info "Other files in $HISTORY were left alone"
+		fi
 	else
 		info "No history on the server"
 	fi

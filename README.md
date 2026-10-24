@@ -1,5 +1,7 @@
 # git-everywhere
 
+> **Experimental.** Try it on a copy or a test folder first, and keep your usual backups.
+
 Version control for directories you can only reach via SFTP, FTP, WebDAV, S3 or any other storage
 [rclone](https://rclone.org) supports. For example cheap web hosting without SSH access.
 
@@ -18,7 +20,7 @@ Nothing is installed or executed on the server.
 
 ## Install
 
-You need `bash` (3.2 or newer), `git` (2.28 or newer) and `rclone`.
+You need `bash` (3.2 or newer), `git` (2.28 or newer) and `rclone` (1.66 or newer).
 
 ```sh
 brew install rclone            # or see https://rclone.org/install/
@@ -64,9 +66,14 @@ Extra rclone flags go into `RCLONE_FLAGS`, e.g. `RCLONE_FLAGS="--checksum -v" gi
 | `<remote>.git-everywhere/` | the history, e.g. `myhost:htdocs.git-everywhere`. Choose another place with `--history`. |
 | `<remote>.git-everywhere/bundles/000001-<commit>.bundle` | one file per snapshot with the commits since the previous one. Files are only added, never changed. |
 | `<remote>.git-everywhere/everywhere-filter` | the shared exclude rules |
+| `<remote>.git-everywhere/.git-everywhere-history` | marker file: rclone never syncs a folder containing it, so the history is safe even inside the synced folder |
 | `<dir>/` | local copy of the files, a normal git work tree |
 | `<dir>/.git/config` | `everywhere.remote`, `everywhere.history` (local only) |
 | `<dir>/.git/everywhere-filter` | [rclone filter rules](https://rclone.org/filtering/) |
+
+Files are stored byte for byte: `.gitignore` and `.gitattributes` files on the server are ignored,
+line endings are not converted, and git repositories on the server (e.g. a plugin installed with
+`git clone`) are versioned as plain files, without their `.git` folder.
 
 The history folder gets an `.htaccess` with `Require all denied`, because on many hosts it lies below the
 web root. Check that your server honours it (Apache does), or put the history somewhere that is not served
@@ -91,6 +98,10 @@ download the bundles and run `git fetch <bundle> main` for each of them in order
 - **It needs a lot of space.** Locally you keep a full copy of all files plus the git history, so at least
   twice the size of the site, growing with every change. On the server the first bundle holds a compressed
   copy of everything, and every snapshot adds another bundle that is never deleted.
+- **File names that differ only in case** (`README.txt` and `readme.txt`) cannot both be stored on a
+  case-insensitive disk (macOS, Windows). rclone warns about it, only one of them is versioned.
+- **S3 and similar:** for a remote that is only a bucket (`s3:bucket`), the default history location would
+  be another bucket. Give `--history s3:bucket/.git-everywhere` instead.
 - **Databases are not covered.** Dump them into the directory before a snapshot if you want them versioned.
 - The history lives with the same provider as your files. It is not an off-site backup, but your local
   copy is.
@@ -98,10 +109,11 @@ download the bundles and run `git fetch <bundle> main` for each of them in order
 ## Tests
 
 ```sh
-tests/run.sh
+tests/run.sh           # the main workflow
+tests/regressions.sh   # one test per bug found so far
 ```
 
-Uses a local directory as the server. It has also been tried against SFTP web hosting.
+Both use local directories as the server. It has also been tried against SFTP web hosting.
 
 ## License
 
